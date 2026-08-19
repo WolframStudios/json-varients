@@ -7348,8 +7348,12 @@ struct wide_string_input_helper<BaseInputAdapter, 4>
             }
             else
             {
-                // unknown character
-                utf8_bytes[0] = static_cast<std::char_traits<char>::int_type>(wc);
+                // A code point above U+10FFFF has no UTF-8 encoding. Passing the
+                // unit through would narrow it to int, where 0xFFFFFFFF becomes
+                // char_traits<char>::eof() and would end the input silently, so
+                // emit a byte that is never valid UTF-8 and let the decoder
+                // reject it.
+                utf8_bytes[0] = 0xFF;
                 utf8_bytes_filled = 1;
             }
         }
@@ -9071,6 +9075,11 @@ scan_number_done:
         token_buffer.clear();
         decimal_point_position = std::string::npos;
 
+#if JSON_DIAGNOSTIC_POSITIONS
+        // the first character of the token has already been read, hence the -1
+        token_start_position = position.chars_read_total - 1;
+#endif
+
         note_token_start(std::integral_constant<bool, lazy_token_string> {});
     }
 
@@ -9232,6 +9241,15 @@ scan_number_done:
     {
         return position;
     }
+
+#if JSON_DIAGNOSTIC_POSITIONS
+    /// return the offset of the first character of the last read token; unlike
+    /// the token's parsed value, this accounts for escape sequences
+    constexpr std::size_t get_token_start_position() const noexcept
+    {
+        return token_start_position;
+    }
+#endif
 
     /// seekable adapter: rebuild the last read token from the input on demand
     const std::vector<char_type>& collect_token_chars(std::vector<char_type>& out, std::true_type /*lazy*/) const
@@ -9432,6 +9450,12 @@ scan_number_done:
     /// start offset of the current token within the input, used to reconstruct
     /// the last read token on error for seekable adapters (see collect_token_chars)
     std::size_t token_string_start = 0;
+
+#if JSON_DIAGNOSTIC_POSITIONS
+    /// start offset of the current token within the input, used to report
+    /// diagnostic positions (see reset())
+    std::size_t token_start_position = 0;
+#endif
 
     /// buffer for variable-length tokens (numbers, strings)
     string_t token_buffer {};
@@ -9809,8 +9833,10 @@ class json_sax_dom_parser
 
                 case value_t::string:
                 {
-                    // include the length of the quotes, which is 2
-                    v.start_position = v.end_position - v.m_data.m_value.string->size() - 2;
+                    // escape sequences make the token longer than the value it
+                    // parses to, so the start position cannot be derived from
+                    // the value; use the offset the lexer recorded instead
+                    v.start_position = m_lexer_ref->get_token_start_position();
                     break;
                 }
 
@@ -10208,8 +10234,10 @@ class json_sax_dom_callback_parser
 
                 case value_t::string:
                 {
-                    // include the length of the quotes, which is 2
-                    v.start_position = v.end_position - v.m_data.m_value.string->size() - 2;
+                    // escape sequences make the token longer than the value it
+                    // parses to, so the start position cannot be derived from
+                    // the value; use the offset the lexer recorded instead
+                    v.start_position = m_lexer_ref->get_token_start_position();
                     break;
                 }
 
@@ -11059,15 +11087,6 @@ class binary_reader
     // CBOR //
     //////////
 
-    /*!
-    @param[in] get_char  whether a new character should be retrieved from the
-                         input (true) or whether the last read character should
-                         be considered instead (false)
-    @param[in] tag_handler how CBOR tags should be treated
-
-    @return whether a valid CBOR value was passed to the SAX parser
-    */
-
     template<typename NumberType>
     bool get_cbor_negative_integer()
     {
@@ -11086,6 +11105,14 @@ class binary_reader
         return sax->number_integer(static_cast<number_integer_t>(-1) - static_cast<number_integer_t>(number));
     }
 
+    /*!
+    @param[in] get_char  whether a new character should be retrieved from the
+                         input (true) or whether the last read character should
+                         be considered instead (false)
+    @param[in] tag_handler how CBOR tags should be treated
+
+    @return whether a valid CBOR value was passed to the SAX parser
+    */
     bool parse_cbor_internal(const bool get_char,
                              const cbor_tag_handler_t tag_handler)
     {
@@ -12582,7 +12609,11 @@ class binary_reader
     {
         if (get_char)
         {
-            get();  // TODO(niels): may we ignore N here?
+            // no get_ignore_noop() here: the byte read next must be a string
+            // length type specification, and a no-op ('N') is not valid in
+            // that position. No-ops at positions where a value may appear are
+            // already consumed by the callers via get_ignore_noop().
+            get();
         }
 
         if (JSON_HEDLEY_UNLIKELY(!unexpect_eof(input_format, "value")))
@@ -16767,8 +16798,13 @@ NLOHMANN_JSON_NAMESPACE_END
 #include <cstring> // memcpy
 #include <limits> // numeric_limits
 #include <string> // string
+#include <type_traits> // enable_if, is_constructible
 #include <utility> // move
 #include <vector> // vector
+
+#ifdef _MSC_VER
+    #include <cstdlib> // _byteswap_ushort, _byteswap_ulong, _byteswap_uint64
+#endif
 
 // #include <nlohmann/detail/input/binary_reader.hpp>
 
@@ -16823,28 +16859,66 @@ template<typename CharType> struct output_adapter_protocol
 template<typename CharType>
 using output_adapter_t = std::shared_ptr<output_adapter_protocol<CharType>>;
 
-/// output adapter for byte vectors
+/// @brief non-virtual output sink writing into a std::vector
+///
+/// This sink is not part of the virtual output_adapter_protocol hierarchy: it is
+/// passed to binary_writer by value as a template parameter, so
+/// write_character()/write_characters() are ordinary (inlinable) calls with no
+/// vtable lookup and no shared_ptr. It is used for the common
+/// `to_cbor`/`to_msgpack`/... into a std::vector. output_vector_adapter below
+/// wraps this same sink to provide the virtual interface.
 template<typename CharType, typename AllocatorType = std::allocator<CharType>>
-class output_vector_adapter : public output_adapter_protocol<CharType>
+class output_vector_sink
 {
   public:
-    explicit output_vector_adapter(std::vector<CharType, AllocatorType>& vec) noexcept
+    explicit output_vector_sink(std::vector<CharType, AllocatorType>& vec) noexcept
         : v(vec)
     {}
 
-    void write_character(CharType c) override
+    void write_character(CharType c)
     {
         v.push_back(c);
     }
 
-    JSON_HEDLEY_NON_NULL(2)
-    void write_characters(const CharType* s, std::size_t length) override
+    // no JSON_HEDLEY_NON_NULL here: binary_writer legitimately passes a null
+    // pointer with length 0 for empty strings/binary values. Appending an empty
+    // range is a no-op; the type-erased path tolerates this via the (unattributed)
+    // virtual base, and the concrete sink must do the same.
+    void write_characters(const CharType* s, std::size_t length)
     {
         v.insert(v.end(), s, s + length);
     }
 
   private:
     std::vector<CharType, AllocatorType>& v;
+};
+
+/// output adapter for byte vectors
+///
+/// The appending itself lives in output_vector_sink; this class only adds the
+/// virtual output_adapter_protocol interface on top of it, so both the
+/// type-erased and the templated path share one implementation.
+template<typename CharType, typename AllocatorType = std::allocator<CharType>>
+class output_vector_adapter : public output_adapter_protocol<CharType>
+{
+  public:
+    explicit output_vector_adapter(std::vector<CharType, AllocatorType>& vec) noexcept
+        : sink(vec)
+    {}
+
+    void write_character(CharType c) override
+    {
+        sink.write_character(c);
+    }
+
+    JSON_HEDLEY_NON_NULL(2)
+    void write_characters(const CharType* s, std::size_t length) override
+    {
+        sink.write_characters(s, length);
+    }
+
+  private:
+    output_vector_sink<CharType, AllocatorType> sink;
 };
 
 #ifndef JSON_NO_IO
@@ -16897,39 +16971,6 @@ class output_string_adapter : public output_adapter_protocol<CharType>
     StringType& str;
 };
 
-/// @brief non-virtual output sink writing into a std::vector
-///
-/// Unlike output_vector_adapter, this sink is not part of the virtual
-/// output_adapter_protocol hierarchy: it is passed to binary_writer by value as
-/// a template parameter, so write_character()/write_characters() are ordinary
-/// (inlinable) calls with no vtable lookup and no shared_ptr. It is used for the
-/// common `to_cbor`/`to_msgpack`/... into a std::vector.
-template<typename CharType, typename AllocatorType = std::allocator<CharType>>
-class output_vector_sink
-{
-  public:
-    explicit output_vector_sink(std::vector<CharType, AllocatorType>& vec) noexcept
-        : v(vec)
-    {}
-
-    void write_character(CharType c)
-    {
-        v.push_back(c);
-    }
-
-    // no JSON_HEDLEY_NON_NULL here: binary_writer legitimately passes a null
-    // pointer with length 0 for empty strings/binary values. Appending an empty
-    // range is a no-op; the type-erased path tolerates this via the (unattributed)
-    // virtual base, and the concrete sink must do the same.
-    void write_characters(const CharType* s, std::size_t length)
-    {
-        v.insert(v.end(), s, s + length);
-    }
-
-  private:
-    std::vector<CharType, AllocatorType>& v;
-};
-
 /// @brief output sink forwarding to a type-erased output adapter
 ///
 /// Wraps the polymorphic output_adapter_t so the same binary_writer template can
@@ -16960,7 +17001,7 @@ class output_adapter_sink
     }
 
   private:
-    output_adapter_t<CharType> oa = nullptr;
+    output_adapter_t<CharType> oa;
 };
 
 template<typename CharType, typename StringType = std::basic_string<CharType>>
@@ -17010,31 +17051,33 @@ enum class bjdata_version_t
 ///////////////////
 
 /*!
-@brief conservative capacity hint for binary serialization into a std::vector
+@brief capacity hint for binary serialization into a std::vector
 
-Returns an approximate number of bytes to reserve up front so that serializing
-an array/object of many elements does not repeatedly reallocate the output
-buffer. Only the top-level element count is consulted (O(1), no walk of the
-DOM), and the result is clamped to a fixed ceiling: a large or untrusted DOM can
-therefore never trigger an oversized allocation here, and the multiplication
-cannot overflow. The buffer still grows geometrically beyond the hint, so a hint
-that is too small only costs a few later reallocations. A single scalar, string,
-or binary value is written in one shot and needs no hint.
+Returns a *lower* bound on the number of bytes the serialization will produce,
+so that writing an array/object of many elements does not start reallocating
+from an empty buffer. Every array element occupies at least one byte in every
+supported binary format, and every object entry at least two (a key of at least
+one byte plus a value of at least one), plus one byte for the container header,
+so the hint can never exceed the final size and the returned vector is never
+left holding capacity the caller did not ask for. The buffer still grows
+geometrically past the hint, so under-reserving only costs a few later
+reallocations. Only the top-level element count is consulted (O(1), no walk of
+the DOM); a single scalar, string, or binary value is written in one shot and
+needs no hint.
 */
 template<typename BasicJsonType>
 std::size_t binary_reserve_hint(const BasicJsonType& j)
 {
-    constexpr std::size_t max_hint = static_cast<std::size_t>(1) << 20; // 1 MiB
-    if (j.is_array() || j.is_object())
+    if (j.is_array())
     {
-        const std::size_t elements = j.size();
-        // guard the multiplication against overflow and cap the reservation
-        if (elements > max_hint / 4)
-        {
-            return max_hint;
-        }
-        return (elements * 4) + 2;
+        return j.size() + 1;
     }
+
+    if (j.is_object())
+    {
+        return (j.size() * 2) + 1;
+    }
+
     return 0;
 }
 
@@ -17064,12 +17107,15 @@ class binary_writer
 
     Convenience constructor for the default (output_adapter_sink) sink so the
     `output_adapter`-based overloads keep constructing the writer directly from
-    an adapter. Only participates in overload resolution when the sink can be
-    built from an adapter.
+    an adapter. Constrained to sinks that can actually be built from an adapter,
+    so that a writer over some other sink type is not advertised as constructible
+    from one.
 
     @param[in] adapter  output adapter to write to
     */
-    explicit binary_writer(output_adapter_t<CharType> adapter) : oa(OutputSinkType(std::move(adapter)))
+    template < typename SinkType = OutputSinkType,
+               typename std::enable_if < std::is_constructible<SinkType, output_adapter_t<CharType>>::value, int >::type = 0 >
+    explicit binary_writer(output_adapter_t<CharType> adapter) : oa(SinkType(std::move(adapter)))
     {}
 
     /*!
@@ -18682,7 +18728,23 @@ class binary_writer
             {
                 return true;
             }
-            len *= static_cast<std::size_t>(el.template get<std::uint64_t>());
+
+            // a dimension that does not fit into std::size_t, or a product that
+            // overflows it, would wrap around and could match the size of
+            // _ArrayData_ by accident; the resulting header announces an
+            // element count that no reader can honor (the binary reader rejects
+            // it with out_of_range.408), so encode as a plain object instead
+            const auto dim = el.template get<std::uint64_t>();
+            if (!value_in_range_of<std::size_t>(dim))
+            {
+                return true;
+            }
+            const auto dim_size = static_cast<std::size_t>(dim);
+            if (dim_size != 0 && len > (std::numeric_limits<std::size_t>::max)() / dim_size)
+            {
+                return true;
+            }
+            len *= dim_size;
         }
 
         key = "_ArrayData_";
@@ -18814,6 +18876,8 @@ class binary_writer
     {
 #if defined(__GNUC__) || defined(__clang__)
         return __builtin_bswap16(x);
+#elif defined(_MSC_VER)
+        return _byteswap_ushort(x);
 #else
         return static_cast<std::uint16_t>((x >> 8) | (x << 8));
 #endif
@@ -18823,6 +18887,8 @@ class binary_writer
     {
 #if defined(__GNUC__) || defined(__clang__)
         return __builtin_bswap32(x);
+#elif defined(_MSC_VER)
+        return _byteswap_ulong(x);
 #else
         return ((x & 0x000000FFu) << 24) | ((x & 0x0000FF00u) << 8)
                | ((x & 0x00FF0000u) >> 8) | ((x & 0xFF000000u) >> 24);
@@ -18833,6 +18899,8 @@ class binary_writer
     {
 #if defined(__GNUC__) || defined(__clang__)
         return __builtin_bswap64(x);
+#elif defined(_MSC_VER)
+        return _byteswap_uint64(x);
 #else
         x = ((x & 0x00000000FFFFFFFFull) << 32) | ((x & 0xFFFFFFFF00000000ull) >> 32);
         x = ((x & 0x0000FFFF0000FFFFull) << 16) | ((x & 0xFFFF0000FFFF0000ull) >> 16);
@@ -18841,30 +18909,40 @@ class binary_writer
 #endif
     }
 
+    /*!
+    @brief reverse the bytes of a buffer by byte-swapping it as UIntType
+
+    Loading the buffer into an unsigned integer of the same width and swapping
+    that is what lets the compiler emit a single bswap/rev/movbe; reversing the
+    buffer element by element does not reliably get there (clang keeps a scalar
+    shuffle). The two memcpy calls are the only portable way to reinterpret the
+    bytes and are folded away by every optimizer.
+    */
+    template<typename UIntType, std::size_t N>
+    static void byte_swap_buffer(std::array<CharType, N>& a) noexcept
+    {
+        static_assert(sizeof(UIntType) == N, "swap width must match the buffer size");
+        UIntType v{};
+        std::memcpy(&v, a.data(), sizeof(v));
+        v = byte_swap(v);
+        std::memcpy(a.data(), &v, sizeof(v));
+    }
+
     // reverse the bytes of a fixed-size buffer; a single byte_swap() for the
     // common 2/4/8-byte number payloads, std::reverse for any other size
     static void reverse_bytes(std::array<CharType, 2>& a) noexcept
     {
-        std::uint16_t v{};
-        std::memcpy(&v, a.data(), sizeof(v));
-        v = byte_swap(v);
-        std::memcpy(a.data(), &v, sizeof(v));
+        byte_swap_buffer<std::uint16_t>(a);
     }
 
     static void reverse_bytes(std::array<CharType, 4>& a) noexcept
     {
-        std::uint32_t v{};
-        std::memcpy(&v, a.data(), sizeof(v));
-        v = byte_swap(v);
-        std::memcpy(a.data(), &v, sizeof(v));
+        byte_swap_buffer<std::uint32_t>(a);
     }
 
     static void reverse_bytes(std::array<CharType, 8>& a) noexcept
     {
-        std::uint64_t v{};
-        std::memcpy(&v, a.data(), sizeof(v));
-        v = byte_swap(v);
-        std::memcpy(a.data(), &v, sizeof(v));
+        byte_swap_buffer<std::uint64_t>(a);
     }
 
     template<std::size_t N>
@@ -18900,7 +18978,9 @@ class binary_writer
         // both branches below are intentionally identical (the "compact" float
         // representation is the value itself). Only GCC diagnoses this, and only
         // when the sink calls are inlined; clang has no such warning.
-#if defined(__GNUC__) && !defined(__clang__)
+        // (-Wduplicated-branches only exists from GCC 7 on; naming it on an older
+        // GCC would itself warn under -Wpragmas)
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ >= 7)
 #pragma GCC diagnostic ignored "-Wduplicated-branches"
 #endif
         if (!std::isfinite(n) || ((static_cast<double>(n) >= static_cast<double>(std::numeric_limits<float>::lowest()) &&
@@ -21657,6 +21737,14 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
     template<typename InputType>
     using binary_reader = ::nlohmann::detail::binary_reader<basic_json, InputType>;
     template<typename CharType> using binary_writer = ::nlohmann::detail::binary_writer<basic_json, CharType>;
+    // binary_writer over a concrete (non-virtual) sink appending into a std::vector,
+    // used by the vector-returning to_* overloads
+    template<typename CharType> using vector_binary_writer =
+    ::nlohmann::detail::binary_writer<basic_json, CharType, ::nlohmann::detail::output_vector_sink<CharType>>;
+    template<typename CharType> static vector_binary_writer<CharType> vector_writer(std::vector<CharType>& v)
+    {
+        return vector_binary_writer<CharType>(::nlohmann::detail::output_vector_sink<CharType>(v));
+    }
 
   JSON_PRIVATE_UNLESS_TESTED:
     using serializer = ::nlohmann::detail::serializer<basic_json>;
@@ -25122,6 +25210,12 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
 
     // note parentheses around operands are necessary; see
     // https://github.com/nlohmann/json/issues/1530
+    // Mixed signed/unsigned integer comparisons check whether the signed value
+    // is negative before casting. If it is, the comparison is performed with
+    // the fixed values -1 and 1, which preserves the ordering relationship
+    // because any negative signed value is smaller than any unsigned value.
+    // Otherwise, the non-negative signed value is cast to unsigned before the
+    // comparison to avoid wraparound.
 #define JSON_IMPLEMENT_OPERATOR(op, null_result, unordered_result, default_result)                       \
     const auto lhs_type = lhs.type();                                                                    \
     const auto rhs_type = rhs.type();                                                                    \
@@ -25180,12 +25274,16 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
     }                                                                                                    \
     else if (lhs_type == value_t::number_unsigned && rhs_type == value_t::number_integer)                \
     {                                                                                                    \
-        return static_cast<number_integer_t>(lhs.m_data.m_value.number_unsigned) op rhs.m_data.m_value.number_integer; \
+        return (rhs.m_data.m_value.number_integer < 0)                                                   \
+               ? (number_integer_t(1) op number_integer_t(-1))                                           \
+               : (lhs.m_data.m_value.number_unsigned op static_cast<number_unsigned_t>(rhs.m_data.m_value.number_integer)); \
     }                                                                                                    \
     else if (lhs_type == value_t::number_integer && rhs_type == value_t::number_unsigned)                \
     {                                                                                                    \
-        return lhs.m_data.m_value.number_integer op static_cast<number_integer_t>(rhs.m_data.m_value.number_unsigned); \
-    }                                                                                                    \
+        return (lhs.m_data.m_value.number_integer < 0)                                                   \
+               ? (number_integer_t(-1) op number_integer_t(1))                                           \
+               : (static_cast<number_unsigned_t>(lhs.m_data.m_value.number_integer) op rhs.m_data.m_value.number_unsigned); \
+    }                                                                                             \
     else if(compares_unordered(lhs, rhs))\
     {\
         return (unordered_result);\
@@ -25798,8 +25896,7 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
     {
         std::vector<std::uint8_t> result;
         result.reserve(detail::binary_reserve_hint(j));
-        detail::binary_writer<basic_json, std::uint8_t, detail::output_vector_sink<std::uint8_t>>(
-            detail::output_vector_sink<std::uint8_t>(result)).write_cbor(j);
+        vector_writer(result).write_cbor(j);
         return result;
     }
 
@@ -25823,8 +25920,7 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
     {
         std::vector<std::uint8_t> result;
         result.reserve(detail::binary_reserve_hint(j));
-        detail::binary_writer<basic_json, std::uint8_t, detail::output_vector_sink<std::uint8_t>>(
-            detail::output_vector_sink<std::uint8_t>(result)).write_msgpack(j);
+        vector_writer(result).write_msgpack(j);
         return result;
     }
 
@@ -25850,8 +25946,7 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
     {
         std::vector<std::uint8_t> result;
         result.reserve(detail::binary_reserve_hint(j));
-        detail::binary_writer<basic_json, std::uint8_t, detail::output_vector_sink<std::uint8_t>>(
-            detail::output_vector_sink<std::uint8_t>(result)).write_ubjson(j, use_size, use_type);
+        vector_writer(result).write_ubjson(j, use_size, use_type);
         return result;
     }
 
@@ -25880,8 +25975,7 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
     {
         std::vector<std::uint8_t> result;
         result.reserve(detail::binary_reserve_hint(j));
-        detail::binary_writer<basic_json, std::uint8_t, detail::output_vector_sink<std::uint8_t>>(
-            detail::output_vector_sink<std::uint8_t>(result)).write_ubjson(j, use_size, use_type, true, true, version);
+        vector_writer(result).write_ubjson(j, use_size, use_type, true, true, version);
         return result;
     }
 
@@ -25909,8 +26003,7 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
     {
         std::vector<std::uint8_t> result;
         result.reserve(detail::binary_reserve_hint(j));
-        detail::binary_writer<basic_json, std::uint8_t, detail::output_vector_sink<std::uint8_t>>(
-            detail::output_vector_sink<std::uint8_t>(result)).write_bson(j);
+        vector_writer(result).write_bson(j);
         return result;
     }
 
